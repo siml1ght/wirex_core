@@ -1,0 +1,22 @@
+# binaries
+*.exe
+*.exe~
+hydra-server
+hydra-client
+
+# build output
+*.log
+*.pid
+*.test
+*.out
+
+# local secrets (never commit real keys)
+*.key
+*.secret
+deploy/*.local.sh
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
