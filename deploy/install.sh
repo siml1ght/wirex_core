@@ -133,8 +133,9 @@ fi
 # ---------------------------------------------------------------- port 53
 
 DNS_PORT=53
+# $4 is Local Address:Port ($5 is the peer) — verified against Debian 13 output
 port53_busy() {
-  command -v ss >/dev/null 2>&1 && ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ':53$'
+  command -v ss >/dev/null 2>&1 && ss -uln 2>/dev/null | awk '{print $4}' | grep -qE ':53$'
 }
 
 if port53_busy; then
@@ -143,6 +144,8 @@ if port53_busy; then
     mkdir -p /etc/systemd/resolved.conf.d
     printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/hydra-no-stub.conf
     systemctl restart systemd-resolved
+    # keep system DNS working: point resolv.conf at real upstreams instead of the dead stub
+    grep -qs '127.0.0.53' /etc/resolv.conf && ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
     sleep 1
   fi
   if port53_busy; then
