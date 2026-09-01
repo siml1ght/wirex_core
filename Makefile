@@ -1,4 +1,4 @@
-HYDRA_NKOBOX_DIR ?= ../nekobox
+HYDRA_NKOBOX_DIR ?= ../nyamebox
 HYDRA_RESOURCE_DIRS := $(HYDRA_NKOBOX_DIR)/resources/bin $(HYDRA_NKOBOX_DIR)
 
 GOBUILD := go build -trimpath -ldflags "-s -w"
