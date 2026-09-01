@@ -28,6 +28,7 @@ type Config struct {
 	Core       io.Reader
 	Replies    io.Writer
 	Drain      time.Duration
+	DNSDomain  string
 }
 
 type Flow struct {
@@ -45,7 +46,7 @@ type replyMsg struct {
 
 type outChannel struct {
 	name    string
-	prefix  []byte
+	kind    proto.ChannelKind
 	conn    *net.UDPConn
 	dst     *net.UDPAddr
 	srcPort int
@@ -53,6 +54,8 @@ type outChannel struct {
 	base    int
 	size    int
 	secret  string
+	dns     *proto.DNSMask
+	stun    *proto.StunMask
 }
 
 type Client struct {
@@ -112,6 +115,11 @@ func New(cfg Config) (*Client, error) {
 
 // the hop channel shares one socket and picks its port per send — that's the whole point
 func (c *Client) buildChannels() error {
+	dnsMask := &proto.DNSMask{Domain: c.cfg.DNSDomain}
+	if dnsMask.Domain == "" {
+		dnsMask.Domain = proto.DefaultDNSDomain
+	}
+	stunMask := &proto.StunMask{Software: "hydra"}
 	for _, ch := range c.cfg.Channels {
 		raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(c.cfg.ServerHost, strconv.Itoa(ch.Port)))
 		if err != nil {
@@ -121,13 +129,20 @@ func (c *Client) buildChannels() error {
 		if err != nil {
 			return fmt.Errorf("hydra: channel %q socket: %w", ch.Name, err)
 		}
-		c.channels = append(c.channels, outChannel{
+		oc := outChannel{
 			name:    ch.Name,
-			prefix:  ch.Prefix,
+			kind:    ch.Kind,
 			conn:    conn,
 			dst:     raddr,
 			srcPort: ch.Port,
-		})
+		}
+		switch ch.Kind {
+		case proto.KindDNS:
+			oc.dns = dnsMask
+		case proto.KindSTUN:
+			oc.stun = stunMask
+		}
+		c.channels = append(c.channels, oc)
 	}
 	if c.cfg.Hopping.Range > 0 {
 		conn, err := net.ListenUDP("udp", nil)
@@ -136,6 +151,7 @@ func (c *Client) buildChannels() error {
 		}
 		c.channels = append(c.channels, outChannel{
 			name:    "hop",
+			kind:    proto.KindHop,
 			conn:    conn,
 			dst:     &net.UDPAddr{IP: c.serverIP},
 			dynamic: true,
@@ -267,8 +283,24 @@ func (oc *outChannel) write(enc []byte) error {
 	if oc.dynamic {
 		dst = &net.UDPAddr{IP: oc.dst.IP, Port: proto.GetHoppingPort(oc.secret, oc.base, oc.size)}
 	}
-	_, err := oc.conn.WriteToUDP(proto.Frame(oc.prefix, enc), dst)
+	wire, err := oc.camouflage(enc)
+	if err != nil {
+		return err
+	}
+	_, err = oc.conn.WriteToUDP(wire, dst)
 	return err
+}
+
+// camouflaged datagram: valid dns/stun messages instead of bare prefixes
+func (oc *outChannel) camouflage(enc []byte) ([]byte, error) {
+	switch {
+	case oc.dns != nil:
+		return oc.dns.BuildQuery(enc)
+	case oc.stun != nil:
+		return oc.stun.BuildRequest(enc)
+	default:
+		return enc, nil
+	}
 }
 
 // replies are only trusted from the server itself, and hop-channel replies must land inside the hop range
@@ -293,9 +325,18 @@ func (c *Client) readChannel(oc *outChannel) {
 		if !c.acceptFrom(oc, src) {
 			continue
 		}
-		framed, err := proto.Unframe(oc.prefix, buf[:n])
-		if err != nil {
-			continue
+		var framed []byte
+		switch {
+		case oc.dns != nil:
+			if framed, err = oc.dns.ParseResponse(buf[:n]); err != nil || len(framed) == 0 {
+				continue
+			}
+		case oc.stun != nil:
+			if framed, _, err = oc.stun.ParseResponse(buf[:n]); err != nil || len(framed) == 0 {
+				continue
+			}
+		default:
+			framed = buf[:n]
 		}
 		plain, err := c.codec.Decrypt(framed)
 		if err != nil {

@@ -28,6 +28,7 @@ func main() {
 	hopSecret := flag.String("hop-secret", "", "TOTP hopping secret (defaults to the key)")
 	hopBase := flag.Int("hop-base", 44000, "first port of the hopping range")
 	hopRange := flag.Int("hop-range", 10, "hopping range size (0 disables the channel)")
+	dnsDomain := flag.String("dns-domain", proto.DefaultDNSDomain, "camouflage domain for the dns channel")
 	verbose := flag.Bool("verbose", false, "log to stderr; without it the core is fully silent")
 	flag.Parse()
 
@@ -70,8 +71,9 @@ func main() {
 			Base:   *hopBase,
 			Range:  *hopRange,
 		},
-		Core:    os.Stdin,
-		Replies: os.Stdout,
+		Core:      os.Stdin,
+		Replies:   os.Stdout,
+		DNSDomain: *dnsDomain,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hydra-client: %v\n", err)

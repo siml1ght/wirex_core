@@ -7,17 +7,25 @@ const (
 	STUNChannelPort = 3478
 )
 
-// the mask prefixes are what DPI sees: "DNS " query bytes on 53, STUN Binding on 3478
+type ChannelKind int
+
+const (
+	KindDNS ChannelKind = iota
+	KindSTUN
+	KindHop
+)
+
 type Channel struct {
 	Name   string
 	Port   int
-	Prefix []byte
+	Kind   ChannelKind
+	Domain string // dns channel only
 }
 
 func DefaultChannels() []Channel {
 	return []Channel{
-		{Name: "dns", Port: DNSChannelPort, Prefix: []byte{0x44, 0x4E, 0x53}},
-		{Name: "stun", Port: STUNChannelPort, Prefix: []byte{0x00, 0x01}},
+		{Name: "dns", Port: DNSChannelPort, Kind: KindDNS, Domain: DefaultDNSDomain},
+		{Name: "stun", Port: STUNChannelPort, Kind: KindSTUN},
 	}
 }
 

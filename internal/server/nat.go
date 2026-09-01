@@ -42,9 +42,12 @@ type Session struct {
 	txReorder *reorder.Buffer[txMsg]
 	mu        sync.RWMutex
 	flows     map[uint32]*NATFlow
-	// per-channel last seen client address; dupes are answered via every channel we've heard from
+	// per-channel last seen client state; dupes are answered via every channel we've heard from
 	clientAddrs map[string]*net.UDPAddr
-	lastChannel string
+	// pending client binding-request txids: server->client data leaves as
+	// binding responses quoting one of these
+	txQueue []([12]byte)
+	lastCh  *listener
 }
 
 func newSession(id uint32) *Session {
@@ -56,15 +59,35 @@ func newSession(id uint32) *Session {
 	}
 }
 
-func (s *Session) noteChannel(name string, addr net.Addr) {
+func (s *Session) noteChannel(l *listener, addr net.Addr) {
 	ua, ok := addr.(*net.UDPAddr)
 	if !ok {
 		return
 	}
 	s.mu.Lock()
-	s.clientAddrs[name] = ua
-	s.lastChannel = name
+	s.clientAddrs[l.ch.Name] = ua
+	s.lastCh = l
 	s.mu.Unlock()
+}
+
+// rememberTx queues a client txid for server->client stun replies
+func (s *Session) rememberTx(tx [12]byte) {
+	s.mu.Lock()
+	if len(s.txQueue) < 64 {
+		s.txQueue = append(s.txQueue, tx)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Session) popTx() ([12]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.txQueue) == 0 {
+		return [12]byte{}, false
+	}
+	tx := s.txQueue[0]
+	s.txQueue = s.txQueue[1:]
+	return tx, true
 }
 
 type NAT struct {
