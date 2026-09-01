@@ -1,9 +1,12 @@
 package client
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -56,16 +59,18 @@ type outChannel struct {
 	secret  string
 	dns     *proto.DNSMask
 	stun    *proto.StunMask
+	rttUs   atomic.Int64 // ewma, microseconds; 0 = no samples yet
 }
 
 type Client struct {
 	cfg        Config
 	codec      *proto.Codec
 	serverIP   net.IP
-	channels   []outChannel
+	channels   []*outChannel
 	txSeq      atomic.Uint32
 	flowSeq    atomic.Uint32
 	rr         atomic.Uint32
+	pingSeq    atomic.Uint32
 	closed     atomic.Bool
 	closeOnce  sync.Once
 	wg         sync.WaitGroup
@@ -94,7 +99,7 @@ func New(cfg Config) (*Client, error) {
 		cfg:        cfg,
 		codec:      codec,
 		serverIP:   raddr0.IP,
-		channels:   make([]outChannel, 0, len(cfg.Channels)+1),
+		channels:   make([]*outChannel, 0, len(cfg.Channels)+1),
 		flowsByKey: make(map[string]*Flow),
 		flowsByID:  make(map[uint32]*Flow),
 		rxReorder:  reorder.New[replyMsg](),
@@ -104,13 +109,43 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	c.wg.Add(len(c.channels))
-	for i := range c.channels {
-		go c.readChannel(&c.channels[i])
+	for _, oc := range c.channels {
+		go c.readChannel(oc)
 	}
+	go c.pingLoop()
 	if cfg.Core != nil {
 		c.startCore()
 	}
 	return c, nil
+}
+
+// one ping per channel per jittered tick: doubles as rtt probe (pong echoes
+// the timestamp) and as keepalive traffic during gameplay idle windows
+func (c *Client) pingLoop() {
+	for {
+		n := 800 + time.Duration(rand64()%600)*time.Millisecond
+		time.Sleep(n)
+		if c.closed.Load() {
+			return
+		}
+		ts := uint64(time.Now().UnixMilli())
+		for _, oc := range c.channels {
+			if c.closed.Load() {
+				return
+			}
+			seq := c.pingSeq.Add(1)
+			plain := proto.MarshalPing(c.cfg.SessionID, seq, ts)
+			if enc, err := c.codec.Encrypt(plain); err == nil {
+				_ = oc.write(proto.Pad(enc))
+			}
+		}
+	}
+}
+
+func rand64() uint64 {
+	var b [8]byte
+	rand.Read(b[:])
+	return binary.LittleEndian.Uint64(b[:])
 }
 
 // the hop channel shares one socket and picks its port per send — that's the whole point
@@ -129,7 +164,7 @@ func (c *Client) buildChannels() error {
 		if err != nil {
 			return fmt.Errorf("hydra: channel %q socket: %w", ch.Name, err)
 		}
-		oc := outChannel{
+		oc := &outChannel{
 			name:    ch.Name,
 			kind:    ch.Kind,
 			conn:    conn,
@@ -149,7 +184,7 @@ func (c *Client) buildChannels() error {
 		if err != nil {
 			return fmt.Errorf("hydra: hopping socket: %w", err)
 		}
-		c.channels = append(c.channels, outChannel{
+		c.channels = append(c.channels, &outChannel{
 			name:    "hop",
 			kind:    proto.KindHop,
 			conn:    conn,
@@ -249,22 +284,23 @@ func (c *Client) removeFlow(flowID uint32) {
 	delete(c.flowsByKey, f.targetKey)
 }
 
-// small packet (<200b) — replicate across all channels at once, zero loss on the fastest path;
-// the server keeps the first copy and drops the dupes. big packets go round-robin to stay cheap.
+// small packet (<200b) — replicate over the two fastest channels for
+// zero loss on the hot path; big ones go round-robin to stay cheap
 func (c *Client) sendEncrypted(plain []byte) error {
 	enc, err := c.codec.Encrypt(plain)
 	if err != nil {
 		return err
 	}
 	if len(enc) < proto.DuplicationThreshold {
+		best := c.twoBest()
 		var wg sync.WaitGroup
-		errs := make([]error, len(c.channels))
-		for i := range c.channels {
+		errs := make([]error, len(best))
+		for i, oc := range best {
 			wg.Add(1)
-			go func(i int) {
+			go func(i int, oc *outChannel) {
 				defer wg.Done()
-				errs[i] = c.channels[i].write(enc)
-			}(i)
+				errs[i] = oc.write(proto.Pad(enc))
+			}(i, oc)
 		}
 		wg.Wait()
 		for _, err := range errs {
@@ -275,7 +311,7 @@ func (c *Client) sendEncrypted(plain []byte) error {
 		return nil
 	}
 	idx := int(c.rr.Add(1)-1) % len(c.channels)
-	return c.channels[idx].write(enc)
+	return c.channels[idx].write(proto.Pad(enc))
 }
 
 func (oc *outChannel) write(enc []byte) error {
@@ -338,6 +374,10 @@ func (c *Client) readChannel(oc *outChannel) {
 		default:
 			framed = buf[:n]
 		}
+		framed, err = proto.UnPad(framed)
+		if err != nil {
+			continue
+		}
 		plain, err := c.codec.Decrypt(framed)
 		if err != nil {
 			continue
@@ -349,11 +389,63 @@ func (c *Client) readChannel(oc *outChannel) {
 		if hdr.SessionID != c.cfg.SessionID {
 			continue
 		}
+		if hdr.Type == proto.PacketPONG && len(body) == 8 {
+			rtt := time.Now().UnixMilli() - int64(binary.BigEndian.Uint64(body))
+			if rtt >= 0 && rtt < 10_000 {
+				c.updateRTT(oc, rtt)
+			}
+			continue
+		}
 		if hdr.Type != proto.PacketDATA && hdr.Type != proto.PacketCLOSE {
 			continue
 		}
 		c.rxReorder.Push(hdr.Seq, replyMsg{typ: hdr.Type, flowID: hdr.FlowID, body: body}, c.deliverReply)
 	}
+}
+
+// ewma over pongs; alpha 1/4 smooths spikes without lagging behind shifts
+func (c *Client) updateRTT(oc *outChannel, rttMs int64) {
+	us := rttMs * 1000
+	for {
+		old := oc.rttUs.Load()
+		var next int64
+		if old == 0 {
+			next = us
+		} else {
+			next = old + (us-old)/4
+		}
+		if oc.rttUs.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// twoBest returns indices of the two lowest-rtt channels; channels without
+// samples yet count as fast (unknown paths deserve traffic to learn from)
+func (c *Client) twoBest() []*outChannel {
+	var order []int
+	for i := range c.channels {
+		order = append(order, i)
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		ra, rb := c.channels[order[a]].rttUs.Load(), c.channels[order[b]].rttUs.Load()
+		if ra == 0 {
+			return false
+		}
+		if rb == 0 {
+			return true
+		}
+		return ra < rb
+	})
+	n := 2
+	if len(order) < n {
+		n = len(order)
+	}
+	out := make([]*outChannel, 0, n)
+	for _, i := range order[:n] {
+		out = append(out, c.channels[i])
+	}
+	return out
 }
 
 func (c *Client) deliverReply(seq uint32, msg replyMsg) {

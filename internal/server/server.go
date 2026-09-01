@@ -245,6 +245,9 @@ func (s *Server) serve(l *listener) {
 		if len(framed) == 0 {
 			continue
 		}
+		if framed, err = proto.UnPad(framed); err != nil {
+			continue
+		}
 		s.acceptTunnelPacket(l, framed, src)
 	}
 }
@@ -379,6 +382,16 @@ func (s *Server) acceptTunnelPacket(l *listener, framed []byte, src net.Addr) {
 	if err != nil {
 		return
 	}
+	if hdr.Type == proto.PacketPING {
+		// rtt probe: pong in place, same channel and port it came from
+		if len(body) == 8 {
+			pong := proto.MarshalPong(hdr.SessionID, hdr.Seq, body)
+			if enc, err := s.codec.Encrypt(pong); err == nil {
+				l.conn.WriteTo(proto.Pad(enc), src)
+			}
+		}
+		return
+	}
 	if hdr.Type != proto.PacketOPEN && hdr.Type != proto.PacketDATA && hdr.Type != proto.PacketCLOSE {
 		return
 	}
@@ -445,12 +458,12 @@ func (s *Server) sendOn(l *listener, sess *Session, enc []byte, replicate bool) 
 		if !ok {
 			return true
 		}
-		wire = l.stun.BuildDataResponse(tx, enc)
+		wire = l.stun.BuildDataResponse(tx, proto.Pad(enc))
 	case l.hop:
 		if !replicate {
 			return false // big packet: one channel is enough, stop here
 		}
-		wire = enc
+		wire = proto.Pad(enc)
 	default:
 		return true
 	}

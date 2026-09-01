@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -10,11 +11,15 @@ const (
 	PacketOPEN  byte = 0x01
 	PacketDATA  byte = 0x02
 	PacketCLOSE byte = 0x03
+	// keepalive + rtt probe: sent on every channel, answered in place,
+	// never touches the reorder window or nat
+	PacketPING byte = 0x04
+	PacketPONG byte = 0x05
 
 	AddrTypeIPv4   byte = 0x01
 	AddrTypeDomain byte = 0x03
 
-	// packets under this size ride every channel at once; bigger ones go round-robin
+	// packets under this size ride several channels at once; bigger ones go round-robin
 	DuplicationThreshold = 200
 
 	WireXHeaderSize = 13
@@ -62,6 +67,23 @@ func MarshalCLOSE(sessionID, flowID, seq uint32) []byte {
 	out := make([]byte, 0, WireXHeaderSize)
 	out = append(out, PacketCLOSE)
 	out = appendHeader(out, sessionID, flowID, seq)
+	return out
+}
+
+// ping/pong carry an 8-byte millisecond timestamp as body; pong echoes seq+ts
+func MarshalPing(sessionID, seq uint32, tsMillis uint64) []byte {
+	out := make([]byte, 0, WireXHeaderSize+8)
+	out = append(out, PacketPING)
+	out = appendHeader(out, sessionID, 0, seq)
+	out = binary.BigEndian.AppendUint64(out, tsMillis)
+	return out
+}
+
+func MarshalPong(sessionID, seq uint32, tsMillis []byte) []byte {
+	out := make([]byte, 0, WireXHeaderSize+8)
+	out = append(out, PacketPONG)
+	out = appendHeader(out, sessionID, 0, seq)
+	out = append(out, tsMillis[:8]...)
 	return out
 }
 
