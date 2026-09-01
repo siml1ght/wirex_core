@@ -136,6 +136,10 @@ done
 
 # ---------------------------------------------------------------- service user
 
+# stop a running instance first: it holds udp :53 and blocks the port checks
+# plus the binary swap; the unit is restarted with the new binary at the end
+systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+
 if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
   log "creating system user: ${SERVICE_USER}"
   useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
@@ -212,7 +216,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+systemctl restart "${SERVICE_NAME}"
 sleep 1
 systemctl is-active --quiet "${SERVICE_NAME}" || {
   journalctl -u "${SERVICE_NAME}" -n 12 --no-pager >&2 || true
