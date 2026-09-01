@@ -115,7 +115,18 @@ chmod 0755 /usr/local/bin/hydra-server
 
 # ---------------------------------------------------------------- secret
 
-SECRET_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SECRET_KEY=""
+# idempotent upgrades: keep the existing secret so client profiles survive redeploys
+if [[ -r "$UNIT_FILE" ]] && grep -q -- '--secret' "$UNIT_FILE"; then
+  SECRET_KEY="$(grep -oP '(?<=--secret )[0-9a-f]{64}' "$UNIT_FILE" | head -n1)"
+  if [[ -n "$SECRET_KEY" ]]; then
+    log "reusing existing secret from the installed unit"
+  fi
+fi
+if [[ -z "$SECRET_KEY" ]]; then
+  SECRET_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+fi
 [[ "$SECRET_KEY" =~ ^[0-9a-f]{64}$ ]] || die "secret generation failed"
 SESSION_ID=0
 while [[ "$SESSION_ID" -eq 0 ]]; do
