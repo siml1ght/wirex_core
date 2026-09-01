@@ -10,15 +10,21 @@ Client traffic is split across three independent channels, each wearing a differ
 
 | Channel | Wire destination | Camouflage |
 |---------|-----------------|------------|
-| `dns`   | UDP 53          | fake DNS transaction prefix (`0x44 0x4E 0x53`) |
-| `stun`  | UDP 3478        | STUN Binding Request prefix (`0x00 0x01`) |
+| `dns`   | UDP 53          | genuine RFC 1035 TXT queries — payload rides in a base32 QNAME under the camouflage domain |
+| `stun`  | UDP 3478        | genuine RFC 8489 Binding Requests — payload rides in a comprehension-optional attribute |
 | `hop`   | pseudo-random UDP ports | port derived as `SHA256(secret ‖ step)` over 5-second steps |
+
+Datagrams leaving every channel are valid protocol messages, and the server answers probes honestly: foreign DNS queries are forwarded to a real recursive resolver and relayed back, foreign STUN probes get a genuine XOR-MAPPED-ADDRESS binding response, garbage gets FORMERR. A port scanner sees a working DNS resolver and a working STUN server — not silence.
 
 Every channel carries identical ChaCha20-Poly1305-protected payloads; the entire Wire-X header — session, flow, sequence — lives inside the AEAD zone, so DPI never observes the internal addressing.
 
 ### Asynchronous Proactive Replication
 
-Packets under 200 bytes (the dominant size class of game input: actions, inputs, movements) are encrypted once and written to all channels simultaneously under the same sequence number. The tunnel endpoint accepts whichever copy arrives first and drops the later ones; observed RTT converges to the fastest channel at every millisecond, and single-channel loss becomes statistically irrelevant. Larger packets travel round-robin to conserve bandwidth.
+Packets under 200 bytes (the dominant size class of game input: actions, inputs, movements) are encrypted once and sent over the **two channels with the lowest RTT** (measured continuously via keepalive pings on a jittered 0.8–1.4 s timer). The tunnel endpoint accepts whichever copy arrives first and drops the later ones; observed RTT converges to the fastest path at every millisecond, and single-channel loss becomes statistically irrelevant. Larger packets travel round-robin to conserve bandwidth.
+
+### Traffic Shaping
+
+Every encrypted packet is wrapped in a plaintext padding envelope (inside the AEAD zone) that snaps its size to one of the classes `{128, 256, 512, 1024}` bytes with crypto-random filler, collapsing the per-tick size distribution into four buckets. The same keepalive pings that carry RTT probes keep all channels breathing through idle windows, so traffic never goes silent and never ticks in a perfectly regular pattern.
 
 ### Stateful Flow Isolation
 
@@ -84,8 +90,10 @@ The GUI launches `hydra-client.exe` as a stdio core: game datagrams flow in as l
 | `--idle-timeout` | `2m` | flow inactivity timeout |
 | `--sweep-every` | `15s` | background cleanup interval |
 | `--verbose` | off | log to stderr; off = fully silent |
+| `--dns-domain` | `cdn-updates.net` | camouflage domain for the DNS channel (must match on client and server) |
+| `--dns-upstream` | system | resolver used to answer forwarded DNS probes (server only) |
 
-The client accepts the same flags plus core I/O over stdin/stdout when launched by NekoBox.
+The client accepts the same flags plus core I/O over stdin/stdout when launched by NekoBox. `--server` accepts either an IP or a **domain name**, bootstrapped over DoH (RFC 8484, Cloudflare/Google endpoints, system resolver fallback) so profiles never need to carry a bare address.
 
 ## License
 

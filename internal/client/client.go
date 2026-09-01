@@ -14,6 +14,7 @@ import (
 
 	"github.com/siml1ght/wirex_core/internal/proto"
 	"github.com/siml1ght/wirex_core/internal/reorder"
+	"github.com/siml1ght/wirex_core/internal/resolver"
 )
 
 type HoppingOptions struct {
@@ -91,14 +92,16 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	raddr0, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.Channels[0].Port)))
+	// the server address may be a domain: bootstrap it over doh so the
+	// profile never carries a bare ip
+	ip, err := resolver.ResolveHost(cfg.ServerHost)
 	if err != nil {
-		return nil, fmt.Errorf("hydra: server address: %w", err)
+		return nil, err
 	}
 	c := &Client{
 		cfg:        cfg,
 		codec:      codec,
-		serverIP:   raddr0.IP,
+		serverIP:   ip,
 		channels:   make([]*outChannel, 0, len(cfg.Channels)+1),
 		flowsByKey: make(map[string]*Flow),
 		flowsByID:  make(map[uint32]*Flow),
@@ -156,10 +159,6 @@ func (c *Client) buildChannels() error {
 	}
 	stunMask := &proto.StunMask{Software: "hydra"}
 	for _, ch := range c.cfg.Channels {
-		raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(c.cfg.ServerHost, strconv.Itoa(ch.Port)))
-		if err != nil {
-			return fmt.Errorf("hydra: channel %q address: %w", ch.Name, err)
-		}
 		conn, err := net.ListenUDP("udp", nil)
 		if err != nil {
 			return fmt.Errorf("hydra: channel %q socket: %w", ch.Name, err)
@@ -168,7 +167,7 @@ func (c *Client) buildChannels() error {
 			name:    ch.Name,
 			kind:    ch.Kind,
 			conn:    conn,
-			dst:     raddr,
+			dst:     &net.UDPAddr{IP: c.serverIP, Port: ch.Port},
 			srcPort: ch.Port,
 		}
 		switch ch.Kind {
